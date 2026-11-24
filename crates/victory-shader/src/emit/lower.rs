@@ -751,7 +751,9 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
         };
-        if self.mask_data == MaskData::None {
+        if self.mask_data == MaskData::None
+            && (prefix.is_some() || matches!(op, Op::AddU | Op::AddF | Op::Xor))
+        {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
@@ -1218,6 +1220,48 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Whether any active lane has its bit set in a tracked lane mask when
+    /// `mask_data == MaskData::None` (mesh shaders): `WaveActiveAnyTrue` is
+    /// wave-size-independent for masks holding only active lanes.
+    fn mask_any_true(&mut self, inst: &Inst, op: &Operand) -> Option<Result<V, Why>> {
+        if self.mask_data != MaskData::None {
+            return None;
+        }
+        let Operand::Scalar { code, .. } = *op else {
+            return None;
+        };
+        if code == NULL {
+            return None;
+        }
+        let lo = inst.read(Reg::S(code))?;
+        let &m = self.x.st.masks.get(&lo)?;
+        if !self.x.st.active.contains(&lo) {
+            return Some(Err("a lane mask holding lanes elsewhere read as data"));
+        }
+        let at = match self.def_block.get(&lo) {
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => match self.tail[b] {
+                Some(t) => t,
+                None => return Some(Err("a lane mask written after its use")),
+            },
+        };
+        if !self.balloting.insert(lo) {
+            return Some(Err("a lane mask whose lanes depend on its own value"));
+        }
+        let bit = self.boolean(m, at);
+        self.balloting.remove(&lo);
+        let bit = match bit {
+            Ok(b) => b,
+            Err(why) => return Some(Err(why)),
+        };
+        let r = self
+            .s
+            .op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        Some(Ok(r))
     }
 
     // ---- operands ----
@@ -2318,6 +2362,47 @@ impl<'a> Lower<'a> {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
 
+    /// `s_*_wrexec_*` / `s_*_saveexec_*` sets `SCC = (new_EXEC != 0)`. When
+    /// immediately followed by a self-looping `s_cbranch_execnz` and `scc` is
+    /// only read outside the loop, every reader sees `new_EXEC == 0`, so
+    /// `SCC` is `false`.
+    fn wrexec_loop_exit_scc(&self, inst: &Inst, scc: Value) -> bool {
+        let name = inst.name();
+        if !(name.contains("wrexec") || name.contains("saveexec")) {
+            return false;
+        }
+        let b = self.cur_ir;
+        let blk = &self.x.p.blocks[b];
+        if !matches!(blk.exit, Exit::Branch { taken, .. } if taken == b) {
+            return false;
+        }
+        if !blk
+            .insts
+            .last()
+            .is_some_and(|last| last.name() == "s_cbranch_execnz")
+        {
+            return false;
+        }
+        let Some(pos) = blk
+            .insts
+            .iter()
+            .position(|x| x.machine.offset == inst.machine.offset)
+        else {
+            return false;
+        };
+        if blk.insts[pos + 1..]
+            .iter()
+            .any(|x| x.write(Reg::S(EXEC)).is_some() || x.write(Reg::Scc).is_some())
+        {
+            return false;
+        }
+        !blk.phis.iter().any(|phi| phi.args.contains(&scc))
+            && !blk
+                .insts
+                .iter()
+                .any(|x| x.reads.iter().any(|&(_, v)| v == scc))
+    }
+
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -2330,6 +2415,17 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.wrexec_loop_exit_scc(inst, scc)
+            {
+                for &(_, v) in &inst.writes {
+                    if v != scc {
+                        self.vals.insert(v, Val::Missing(LANE_MASK));
+                    }
+                }
+                self.vals.insert(scc, Val::Bit(self.s.m.bool(false)));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -2391,6 +2487,25 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(op) = name.strip_prefix("s_cmp_").filter(|o| o.ends_with("_u64")) {
+            let zero = |op: Option<&Operand>| {
+                matches!(op, Some(Operand::Const(128) | Operand::Literal(0)))
+            };
+            let any = if zero(src.get(1)) {
+                src.first().and_then(|o| self.mask_any_true(inst, o))
+            } else if zero(src.first()) {
+                src.get(1).and_then(|o| self.mask_any_true(inst, o))
+            } else {
+                None
+            };
+            if let Some(any) = any {
+                let mut r = any?;
+                if op.starts_with("eq") {
+                    let t = self.s.m.bool(true);
+                    r = self.s.m.bin(c, Bin::Xor, r, t);
+                }
+                self.set(scc, Val::Bit(r));
+                return Ok(());
+            }
             // eq and lg only: both dwords.
             let mut r = None;
             for h in 0..2 {
@@ -2451,6 +2566,12 @@ impl<'a> Lower<'a> {
             };
             return match name {
                 "s_bcnt1_i32_b64" => {
+                    if let Some(any) = src.first().and_then(|o| self.mask_any_true(inst, o)) {
+                        let any = any?;
+                        self.set(lo, Val::Missing(LANE_MASK));
+                        self.set(scc, Val::Bit(any));
+                        return Ok(());
+                    }
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let na = self
@@ -2637,6 +2758,14 @@ impl<'a> Lower<'a> {
                 (r, None)
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
+                if name == "s_bcnt1_i32_b32"
+                    && let Some(any) = src.first().and_then(|o| self.mask_any_true(inst, o))
+                {
+                    let any = any?;
+                    self.set(lo, Val::Missing(LANE_MASK));
+                    self.set(scc, Val::Bit(any));
+                    return Ok(());
+                }
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
                 let a = src32(self, 0)?;
                 let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
@@ -2944,18 +3073,30 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // Prefer an image or vector buffer use over a scalar buffer load when
+        // both exist, so typed/indexed buffer metadata is preserved.
+        let mut use_at = None;
+        for d in self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
+        {
+            if let Some(first) = d.source.leaves().into_iter().find_map(|l| match *l {
+                Source::Loaded { load, first } if load == site => Some(first),
+                _ => None,
+            }) {
+                let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                if matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. }) {
+                    use_at = Some((d.site, first));
+                    break;
+                }
+                if use_at.is_none() {
+                    use_at = Some((d.site, first));
+                }
+            }
+        }
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -2993,6 +3134,21 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                if !matches!(
+                    used,
+                    Some(u) if u.kind == ResourceType::Srv || u.kind == ResourceType::Uav
+                ) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
@@ -4080,7 +4236,13 @@ impl<'a> Lower<'a> {
                     return Err("a mixed-precision result");
                 };
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => match self.i32_of(o) {
+                        Ok(x) => x,
+                        // A dead first-half interpolation result left in the
+                        // VGPR has no data value; the other half is unused.
+                        Err("the first half of an interpolation") => self.s.m.i32(0),
+                        Err(why) => return Err(why),
+                    },
                     None => self.s.m.i32(0),
                 };
                 let h = self
@@ -7417,5 +7579,265 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn s_buffer_load_descriptor_size_lowers_for_srv_and_refuses_cbv() {
+        // Load a buffer descriptor from the table at s0, read through it with
+        // s_buffer_load_dword, and also read its dword 2 (record count) as data.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+            0x800D_0C0A, // s_add_u32 s13, s10, s12
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let run = |kind, stride| {
+            lower_with(
+                &words,
+                vec![root(RootType::Table, 0, 0)],
+                vec![UsedResource {
+                    kind,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+            )
+        };
+        // Structured SRV and raw SRV both lower; a CBV descriptor is refused.
+        run(ResourceType::Srv, 64).expect("structured SRV");
+        run(ResourceType::Srv, 0).expect("raw SRV");
+        match run(ResourceType::Cbv, 0).map(|_| ()) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a constant buffer's descriptor read as data");
+            }
+            other => panic!("expected CBV refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fma_mix_f16_ignores_dead_interp_p1_in_preserved_half() {
+        use crate::native::{PsInput, Usage};
+        let lower_ps = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![PsInput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        mask: 3,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr: 2, // PerspectiveCenter in v0/v1
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code,
+            };
+            let p = ir::build(&native.code, false, 8).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .map(|_| ())
+        };
+        // v_fma_mixlo_f16 v2, 1.0, 1.0, 0.0 overwrites the low half of v2
+        // where a dead v_interp_p1_f32 sat, then a branch reads v2.
+        let mixlo = [0xCC21_0002, 242 | (242 << 9) | (128 << 18)];
+        let use_v2 = [
+            0x7D84_0480, // v_cmp_eq_u32 vcc_lo, 0, v2
+            0xBF86_0001, // s_cbranch_vccz -> s_endpgm
+            0xBE80_0380, // s_mov_b32 s0, 0
+            S_ENDPGM,
+        ];
+        let ok_words = [&[0xC808_0000][..], &mixlo, &use_v2].concat();
+        lower_ps(&ok_words).expect("dead p1 half in v_fma_mixlo_f16");
+        // A real missing value (timestamp) in the preserved half is still refused.
+        let bad_words = [&[0xF490_0180, 0, 0x7E04_0206][..], &mixlo, &use_v2].concat();
+        assert!(matches!(
+            lower_ps(&bad_words),
+            Err(crate::ShaderError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn mesh_shader_wave_any_true_and_idempotent_reductions() {
+        use crate::native::MeshIo;
+        let lower_ms = |words: &[u32], wave64: bool| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: if wave64 { 64 } else { 32 },
+                    max_vertices: 32,
+                    max_primitives: 32,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, wave64, 8).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        // Wave64 mesh: active mask tested for non-zero via s_bcnt1_i32_b64 SCC
+        // or s_cmp_lg_u64 SCC lowers with waveAnyTrue.
+        let bcnt_scc = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE8A_106A, // s_bcnt1_i32_b64 s10, vcc
+            0xBF84_0001, // s_cbranch_scc0 -> s_endpgm
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            S_ENDPGM,
+        ];
+        assert!(lower_ms(&bcnt_scc, true).expect("bcnt1 SCC").wave_ops);
+        let cmp64_scc = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBF13_806A, // s_cmp_lg_u64 vcc, 0
+            0xBF84_0001, // s_cbranch_scc0 -> s_endpgm
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            S_ENDPGM,
+        ];
+        assert!(lower_ms(&cmp64_scc, true).expect("cmp_lg_u64 SCC").wave_ops);
+        // Reading the wave-size-dependent population count SGPR itself is still refused.
+        let bcnt_count = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE8A_106A, // s_bcnt1_i32_b64 s10, vcc
+            0xBF07_800A, // s_cmp_lg_u32 s10, 0
+            0xBF84_0001, // s_cbranch_scc0 -> s_endpgm
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lower_ms(&bcnt_count, true),
+            Err(crate::ShaderError::Unsupported {
+                what: "a lane mask read as data",
+                ..
+            })
+        ));
+        // Whole-wave active reduction in a Wave32 mesh shader: idempotent
+        // min lowers, while wave-size-dependent add is still refused.
+        let reduction = |cnd_ident: u32, dpp_op: u32, vop2_op: u32| {
+            let dpp = |k: u32| [dpp_op, 0xFF08_0001 | ((0x160 | k) << 8)];
+            [
+                &[
+                    0xBE8A_3DC1, // s_or_saveexec_b32 s10, -1
+                    0xD501_0001,
+                    cnd_ident | (256 << 9) | (10 << 18), // v_cndmask_b32 v1, ident, v0, s10
+                ][..],
+                &dpp(1),
+                &dpp(2),
+                &dpp(4),
+                &dpp(8),
+                &[
+                    0xD778_0002,
+                    257 | (128 << 9) | (128 << 18), // v_permlanex16_b32 v2, v1, 0, 0
+                    vop2_op,                        // v_{min,add}_* v1, v1, v2
+                    0xBEFE_030A,                    // s_mov_b32 exec_lo, s10
+                    0x7D84_0280,                    // v_cmp_eq_u32 vcc_lo, 0, v1
+                    0xBF86_0001,                    // s_cbranch_vccz -> s_endpgm
+                    0xBE8B_0380,                    // s_mov_b32 s11, 0
+                    S_ENDPGM,
+                ],
+            ]
+            .concat()
+        };
+        assert!(
+            lower_ms(&reduction(0xC1, 0x2602_02FA, 0x2602_0501), false)
+                .expect("idempotent min_u32 reduction in mesh")
+                .wave_ops
+        );
+        assert!(matches!(
+            lower_ms(&reduction(0x80, 0x4A02_02FA, 0x4A02_0501), false),
+            Err(crate::ShaderError::Unsupported {
+                what: "a wave reduction in a mesh shader",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wrexec_self_loop_exit_scc_is_false() {
+        // s_andn2_wrexec_b32 + self-looping s_cbranch_execnz leaves SCC = false
+        // for every reader after the loop exits (EXEC == 0).
+        let ok = [
+            0xBE82_037E, // 0:  s_mov_b32 s2, exec_lo
+            0x7D84_0080, // 4:  v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE84_476A, // 8:  s_andn2_wrexec_b32 s4, vcc_lo
+            0xBF89_FFFD, // 12: s_cbranch_execnz -> 4
+            0xBEFE_0302, // 16: s_mov_b32 exec_lo, s2
+            0x8506_8081, // 20: s_cselect_b32 s6, 1, 0
+            0xBF07_8006, // 24: s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // 28: s_cbranch_scc1 -> s_endpgm
+            0xBE87_0380, // 32: s_mov_b32 s7, 0
+            S_ENDPGM,
+        ];
+        lowers(&ok, 0).expect("loop-exit SCC is false");
+        // Reading SCC inside the loop before exit is still refused.
+        let inside = [
+            0xBE82_037E, // 0:  s_mov_b32 s2, exec_lo
+            0x7D84_0080, // 4:  v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE84_476A, // 8:  s_andn2_wrexec_b32 s4, vcc_lo
+            0x8506_8081, // 12: s_cselect_b32 s6, 1, 0 (reads SCC inside loop)
+            0xBF89_FFFC, // 16: s_cbranch_execnz -> 4
+            0xBEFE_0302, // 20: s_mov_b32 exec_lo, s2
+            0xBF07_8006, // 24: s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // 28: s_cbranch_scc1 -> s_endpgm
+            0xBE87_0380, // 32: s_mov_b32 s7, 0
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lowers(&inside, 0),
+            Err(crate::ShaderError::Unsupported {
+                what: "a lane mask read as data",
+                ..
+            })
+        ));
     }
 }
