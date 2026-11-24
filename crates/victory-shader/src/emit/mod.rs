@@ -746,4 +746,59 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    #[test]
+    fn correlated_flag_jump_threading_avoids_spurious_lane_mask_phi() {
+        // B0 leaves a dead lane mask in s2 and sentinel v0 = 0 before jumping
+        // to B_join. B_load overwrites s2 with user data s1 and sets a dynamic
+        // flag in v0. B_join skips B_use whenever v0 != -1, so threading B0
+        // past B_join keeps s2 a plain scalar in B_use (`s_and_b32` with a
+        // non-mask constant would otherwise fail as "a constant lane mask").
+        let words = [
+            0xBE82_037Eu32, // 0:  s_mov_b32 s2, exec_lo
+            0x7E00_0280,    // 4:  v_mov_b32 v0, 0
+            0xBF04_8000,    // 8:  s_cmp_lt_i32 s0, 0
+            0xBF85_0003,    // 12: s_cbranch_scc1 -> 28 (B_join)
+            0xBE82_0301,    // 16: s_mov_b32 s2, s1
+            0x7E00_0201,    // 20: v_mov_b32 v0, s1
+            0xBF82_0000,    // 24: s_branch -> 28 (B_join)
+            0x7D84_00C1,    // 28: v_cmp_eq_u32 vcc_lo, -1, v0
+            0x8A6A_6A7E,    // 32: s_andn2_b32 vcc_lo, exec_lo, vcc_lo
+            0xBF87_0003,    // 36: s_cbranch_vccnz -> 52 (B_exit)
+            0x8702_FF02,    // 40: s_and_b32 s2, s2, 0x100000
+            0x0010_0000,
+            0x7E02_0202, // 48: v_mov_b32 v1, s2
+            0xBF81_0000, // 52: s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: crate::native::RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(out.stage, super::HwStage::Ps);
+        assert!(!out.dxil.is_empty());
+    }
 }

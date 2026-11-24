@@ -15,8 +15,10 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
+use std::collections::HashMap;
+
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Fields, Flow, Instruction, NULL, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -203,6 +205,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         });
     }
     split_irreducible(&mut blocks)?;
+    thread_jumps(&mut blocks, wave64)?;
 
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
@@ -295,6 +298,11 @@ fn reg_at(i: usize) -> Reg {
 fn insert(set: &mut RegSet, reg: Reg) {
     let i = index(reg);
     set[i / 64] |= 1 << (i % 64);
+}
+
+fn remove(set: &mut RegSet, reg: Reg) {
+    let i = index(reg);
+    set[i / 64] &= !(1 << (i % 64));
 }
 
 fn contains(set: &RegSet, reg: Reg) -> bool {
@@ -545,6 +553,692 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         }
     }
     None
+}
+
+/// Correlated-branch jump threading, before SSA.
+///
+/// The console compiler often skips a conditional load block after setting a
+/// sentinel flag (`v_mov_b32 v, 0; s_cbranch_scc1 merge`), then tests that
+/// flag at the join block before branching around uses of the loaded SGPRs.
+/// On the skipped edge those SGPRs still hold dead values from earlier code
+/// (e.g. a descriptor or lane mask), which would form spurious mixed phis
+/// unless the statically known edge is threaded past the join's branch.
+fn thread_jumps(blocks: &mut Vec<Block>, wave64: bool) -> Result<(), ShaderError> {
+    const MAX_JOIN_INSTS: usize = 32;
+    const MAX_CHAIN: usize = 4;
+    let limit = blocks.len() + blocks.len().max(64);
+    let empty_consts = HashMap::new();
+    let mut threaded = false;
+
+    for _ in 0..8 {
+        let order = reverse_postorder(blocks);
+        let mut index = vec![usize::MAX; blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            index[b] = i;
+        }
+        let mut live_in: Option<Vec<RegSet>> = None;
+        let mut changed = false;
+
+        let count = blocks.len();
+        for m in 0..count {
+            if blocks.len() >= limit {
+                break;
+            }
+            if index[m] == usize::MAX || blocks[m].preds.len() < 2 {
+                continue;
+            }
+            let Exit::Branch { taken, not_taken } = blocks[m].exit else {
+                continue;
+            };
+            if taken == not_taken || blocks[m].insts.len() > MAX_JOIN_INSTS {
+                continue;
+            }
+            if !is_threadable_join(&blocks[m]) {
+                continue;
+            }
+            // Only thread branches that depend on an incoming edge's constants
+            // (not ones that trivially fold without them, e.g. testing EXEC).
+            if eval_join_branch(&blocks[m], &empty_consts, wave64).is_some() {
+                continue;
+            }
+            let preds = blocks[m].preds.clone();
+            for p in preds {
+                if blocks.len() >= limit {
+                    break;
+                }
+                if p == m
+                    || index[p] == usize::MAX
+                    || index[p] >= index[m]
+                    || !blocks[p].exit.successors().contains(&m)
+                {
+                    continue;
+                }
+                let consts = incoming_constants(blocks, p, MAX_CHAIN);
+                if consts.is_empty() {
+                    continue;
+                }
+                let Some(go_taken) = eval_join_branch(&blocks[m], &consts, wave64) else {
+                    continue;
+                };
+                let target = if go_taken { taken } else { not_taken };
+                if target == m || target == 0 {
+                    continue;
+                }
+
+                let live = live_in.get_or_insert_with(|| liveness(blocks, &order).0);
+                let pruned = prune_join_body(&blocks[m], &live[target]);
+                let dest = if pruned.is_empty() {
+                    target
+                } else {
+                    let copy_idx = blocks.len();
+                    blocks.push(Block {
+                        offset: blocks[m].offset,
+                        preds: Vec::new(),
+                        phis: Vec::new(),
+                        insts: pruned,
+                        exit: Exit::Jump(target),
+                    });
+                    copy_idx
+                };
+
+                retarget_pred_edge(&mut blocks[p], m, dest);
+                changed = true;
+                threaded = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+        prune_unreachable(blocks);
+        link(blocks);
+    }
+
+    if threaded {
+        split_irreducible(blocks)?;
+    }
+    Ok(())
+}
+
+/// Clears unreachable blocks so `link` never leaves an unreachable predecessor
+/// in a reachable block's `preds` list.
+fn prune_unreachable(blocks: &mut [Block]) {
+    let order = reverse_postorder(blocks);
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        if !reachable[b] {
+            block.insts.clear();
+            block.exit = Exit::End;
+        }
+    }
+}
+
+fn retarget_pred_edge(pred: &mut Block, from: usize, to: usize) {
+    match &mut pred.exit {
+        Exit::Jump(s) if *s == from => *s = to,
+        Exit::Branch { taken, not_taken } => {
+            if *taken == from {
+                *taken = to;
+            }
+            if *not_taken == from {
+                *not_taken = to;
+            }
+            if *taken == *not_taken {
+                let target = *taken;
+                pred.exit = Exit::Jump(target);
+                if pred
+                    .insts
+                    .last()
+                    .is_some_and(|i| i.name().starts_with("s_cbranch_"))
+                {
+                    pred.insts.pop();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `block` is a small, side-effect-free, EXEC-preserving conditional
+/// join whose body can safely be evaluated and duplicated on a threaded edge.
+fn is_threadable_join(block: &Block) -> bool {
+    let Some((last, body)) = block.insts.split_last() else {
+        return false;
+    };
+    if !matches!(
+        last.name(),
+        "s_cbranch_vccz" | "s_cbranch_vccnz" | "s_cbranch_scc0" | "s_cbranch_scc1"
+    ) {
+        return false;
+    }
+    body.iter().all(|inst| {
+        if inst
+            .writes
+            .iter()
+            .any(|&(r, _)| r == Reg::S(EXEC) || r == Reg::S(EXEC + 1))
+        {
+            return false;
+        }
+        match &inst.fields {
+            Fields::Sop { .. } => {
+                let name = inst.name();
+                !name.starts_with("s_setreg")
+                    && !name.starts_with("s_set_")
+                    && !name.starts_with("s_cbranch")
+                    && !name.starts_with("s_swappc")
+                    && !name.starts_with("s_setpc")
+                    && !name.starts_with("s_call")
+                    && !name.starts_with("s_rfe")
+            }
+            Fields::Valu(v) => {
+                let name = inst.name();
+                v.dpp.is_none()
+                    && !name.starts_with("v_readlane")
+                    && !name.starts_with("v_writelane")
+                    && !name.starts_with("v_readfirstlane")
+                    && !name.starts_with("v_permlane")
+                    && !name.starts_with("v_movrel")
+                    && !name.starts_with("v_swaprel")
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Copies `block`'s non-branch instructions and drops those whose writes are
+/// dead on entry to `target`.
+fn prune_join_body(block: &Block, live_target: &RegSet) -> Vec<Inst> {
+    let body = &block.insts[..block.insts.len() - 1];
+    let mut live = *live_target;
+    let mut keep = vec![false; body.len()];
+    for (i, inst) in body.iter().enumerate().rev() {
+        if inst.writes.iter().any(|&(r, _)| contains(&live, r)) {
+            keep[i] = true;
+            for &(r, _) in &inst.writes {
+                remove(&mut live, r);
+            }
+            for &(r, _) in &inst.reads {
+                insert(&mut live, r);
+            }
+        }
+    }
+    body.iter()
+        .zip(keep)
+        .filter(|&(_, k)| k)
+        .map(|(inst, _)| inst.clone())
+        .collect()
+}
+
+/// Known constant register values at the exit of `p`, gathered along its
+/// unique single-predecessor chain (stopping if EXEC changes or the chain
+/// splits).
+fn incoming_constants(blocks: &[Block], p: usize, max_chain: usize) -> HashMap<Reg, u32> {
+    let mut chain = vec![p];
+    while chain.len() < max_chain {
+        let cur = *chain.last().expect("non-empty");
+        if blocks[cur].preds.len() != 1 {
+            break;
+        }
+        let prev = blocks[cur].preds[0];
+        if chain.contains(&prev) {
+            break;
+        }
+        let ok = match blocks[prev].exit {
+            Exit::Jump(t) => t == cur,
+            Exit::Branch { taken, not_taken } if taken == cur || not_taken == cur => {
+                blocks[prev].insts.last().is_some_and(|i| {
+                    matches!(
+                        i.name(),
+                        "s_cbranch_scc0" | "s_cbranch_scc1" | "s_cbranch_vccz" | "s_cbranch_vccnz"
+                    )
+                })
+            }
+            _ => false,
+        };
+        if !ok {
+            break;
+        }
+        chain.push(prev);
+    }
+
+    let mut consts = HashMap::new();
+    for b in chain.into_iter().rev() {
+        for inst in &blocks[b].insts {
+            if inst
+                .writes
+                .iter()
+                .any(|&(r, _)| r == Reg::S(EXEC) || r == Reg::S(EXEC + 1))
+            {
+                consts.retain(|r, _| !matches!(r, Reg::V(_)));
+            }
+            step_constants(inst, &mut consts);
+        }
+    }
+    consts
+}
+
+/// Updates `consts` with any simple constant-producing move, invalidating all
+/// other written registers.
+fn step_constants(inst: &Inst, consts: &mut HashMap<Reg, u32>) {
+    let name = inst.name();
+    let known = match &inst.fields {
+        Fields::Valu(v)
+            if name == "v_mov_b32"
+                && !v.clamp
+                && v.omod == 0
+                && v.neg == 0
+                && v.abs == 0
+                && v.sdwa.is_none()
+                && v.dpp.is_none() =>
+        {
+            match (v.dst, v.src.first()) {
+                (Some(Operand::Vector { reg, dwords: 1 }), Some(src)) => {
+                    operand_const(src, consts).map(|val| (Reg::V(reg), val))
+                }
+                _ => None,
+            }
+        }
+        Fields::Sop {
+            dst: Some(Operand::Scalar { code, dwords: 1 }),
+            src,
+            imm,
+        } if *code != NULL && *code != EXEC && *code != EXEC + 1 => match name {
+            "s_mov_b32" => src
+                .first()
+                .and_then(|s| operand_const(s, consts))
+                .map(|val| (Reg::S(*code), val)),
+            "s_movk_i32" => imm.map(|k| (Reg::S(*code), i32::from(k as i16) as u32)),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    for &(r, _) in &inst.writes {
+        consts.remove(&r);
+    }
+    if let Some((r, val)) = known {
+        consts.insert(r, val);
+    }
+}
+
+fn operand_const(op: &Operand, consts: &HashMap<Reg, u32>) -> Option<u32> {
+    match *op {
+        Operand::Literal(x) => Some(x),
+        Operand::Const(c) => inline_const(c),
+        Operand::Scalar { code: NULL, .. } => Some(0),
+        Operand::Scalar { code, dwords: 1 } => consts.get(&Reg::S(code)).copied(),
+        Operand::Vector { reg, dwords: 1 } => consts.get(&Reg::V(reg)).copied(),
+        _ => None,
+    }
+}
+
+fn inline_const(c: u8) -> Option<u32> {
+    Some(match c {
+        128..=192 => u32::from(c - 128),
+        193..=208 => (192i32 - i32::from(c)) as u32,
+        240 => 0.5f32.to_bits(),
+        241 => (-0.5f32).to_bits(),
+        242 => 1.0f32.to_bits(),
+        243 => (-1.0f32).to_bits(),
+        244 => 2.0f32.to_bits(),
+        245 => (-2.0f32).to_bits(),
+        246 => 4.0f32.to_bits(),
+        247 => (-4.0f32).to_bits(),
+        248 => 0x3E22_F983, // 1 / (2 * pi)
+        _ => return None,
+    })
+}
+
+/// Known bit values of a lane mask in active (`EXEC == 1`) and inactive
+/// (`EXEC == 0`) lanes. Tracking both regions separately keeps wave-wide zero /
+/// non-zero tests sound when `EXEC` is partial (e.g. `!EXEC` is not zero).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MaskBits {
+    active: Option<bool>,
+    inactive: Option<bool>,
+}
+
+impl MaskBits {
+    const UNKNOWN: Self = Self {
+        active: None,
+        inactive: None,
+    };
+    const ZERO: Self = Self {
+        active: Some(false),
+        inactive: Some(false),
+    };
+    const ALL_ONES: Self = Self {
+        active: Some(true),
+        inactive: Some(true),
+    };
+    const EXEC: Self = Self {
+        active: Some(true),
+        inactive: Some(false),
+    };
+
+    fn not(self) -> Self {
+        Self {
+            active: self.active.map(|b| !b),
+            inactive: self.inactive.map(|b| !b),
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        Self {
+            active: bit_and(self.active, other.active),
+            inactive: bit_and(self.inactive, other.inactive),
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        Self {
+            active: bit_or(self.active, other.active),
+            inactive: bit_or(self.inactive, other.inactive),
+        }
+    }
+
+    fn xor(self, other: Self) -> Self {
+        Self {
+            active: bit_xor(self.active, other.active),
+            inactive: bit_xor(self.inactive, other.inactive),
+        }
+    }
+
+    /// Whether the mask is definitely non-zero (`Some(true)`) or all-zero
+    /// (`Some(false)`) whenever the wave has active lanes.
+    fn is_nonzero(self) -> Option<bool> {
+        match (self.active, self.inactive) {
+            (Some(false), Some(false)) => Some(false),
+            (Some(true), _) => Some(true),
+            _ => None,
+        }
+    }
+}
+
+fn bit_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn bit_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+fn bit_xor(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x != y),
+        _ => None,
+    }
+}
+
+/// Evaluates `block`'s closing conditional branch given known constant
+/// registers on entry; returns `Some(true)` if taken or `Some(false)` if not.
+fn eval_join_branch(block: &Block, entry_consts: &HashMap<Reg, u32>, wave64: bool) -> Option<bool> {
+    let (last, body) = block.insts.split_last()?;
+    let width = if wave64 { "_b64" } else { "_b32" };
+    let mut consts = entry_consts.clone();
+    let mut masks: HashMap<u8, MaskBits> = HashMap::new();
+    let mut scc_const: Option<bool> = None;
+    let mut scc_mask: Option<MaskBits> = None;
+
+    let mask_of =
+        |op: &Operand, masks: &HashMap<u8, MaskBits>, consts: &HashMap<Reg, u32>| -> MaskBits {
+            match *op {
+                Operand::Scalar { code, .. } if code == EXEC => MaskBits::EXEC,
+                Operand::Scalar { code: NULL, .. } => MaskBits::ZERO,
+                Operand::Scalar { code, .. } => masks.get(&code).copied().unwrap_or_else(|| {
+                    if !wave64 {
+                        match consts.get(&Reg::S(code)) {
+                            Some(&0) => MaskBits::ZERO,
+                            Some(&u32::MAX) => MaskBits::ALL_ONES,
+                            _ => MaskBits::UNKNOWN,
+                        }
+                    } else {
+                        MaskBits::UNKNOWN
+                    }
+                }),
+                Operand::Const(128) | Operand::Literal(0) => MaskBits::ZERO,
+                Operand::Const(193) => MaskBits::ALL_ONES,
+                Operand::Literal(u32::MAX) if !wave64 => MaskBits::ALL_ONES,
+                _ => MaskBits::UNKNOWN,
+            }
+        };
+
+    for inst in body {
+        let name = inst.name();
+        let mut new_mask: Option<(u8, MaskBits)> = None;
+        let mut new_scc_const: Option<bool> = None;
+        let mut new_scc_mask: Option<MaskBits> = None;
+
+        match &inst.fields {
+            Fields::Valu(v)
+                if name.starts_with("v_cmp_")
+                    && !v.clamp
+                    && v.omod == 0
+                    && v.sdwa.is_none()
+                    && v.dpp.is_none()
+                    && v.neg == 0
+                    && v.abs == 0 =>
+            {
+                if let (Some(Operand::Scalar { code, .. }), [a, b]) = (v.dst, &v.src[..])
+                    && code != NULL
+                {
+                    let active = operand_const(a, &consts)
+                        .zip(operand_const(b, &consts))
+                        .and_then(|(x, y)| eval_cmp(name, x, y));
+                    // `v_cmp_*` always clears inactive lanes (`EXEC == 0`).
+                    new_mask = Some((
+                        code,
+                        MaskBits {
+                            active,
+                            inactive: Some(false),
+                        },
+                    ));
+                }
+            }
+            Fields::Sop { dst, src, .. } if name.starts_with("s_cmp_") => {
+                if let [a, b] = &src[..]
+                    && let (Some(x), Some(y)) =
+                        (operand_const(a, &consts), operand_const(b, &consts))
+                {
+                    new_scc_const = eval_scmp(name, x, y);
+                }
+                let _ = dst;
+            }
+            Fields::Sop { dst, src, .. } => {
+                if let Some(op) = name.strip_prefix("s_").and_then(|s| s.strip_suffix(width)) {
+                    let res = match op {
+                        "mov" => src
+                            .first()
+                            .map_or(MaskBits::UNKNOWN, |s| mask_of(s, &masks, &consts)),
+                        "not" => src
+                            .first()
+                            .map_or(MaskBits::UNKNOWN, |s| mask_of(s, &masks, &consts).not()),
+                        "and" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts).and(mask_of(b, &masks, &consts))
+                        }),
+                        "or" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts).or(mask_of(b, &masks, &consts))
+                        }),
+                        "xor" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts).xor(mask_of(b, &masks, &consts))
+                        }),
+                        "andn2" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts).and(mask_of(b, &masks, &consts).not())
+                        }),
+                        "orn2" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts).or(mask_of(b, &masks, &consts).not())
+                        }),
+                        "andn1" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts)
+                                .not()
+                                .and(mask_of(b, &masks, &consts))
+                        }),
+                        "orn1" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts)
+                                .not()
+                                .or(mask_of(b, &masks, &consts))
+                        }),
+                        "nand" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts)
+                                .and(mask_of(b, &masks, &consts))
+                                .not()
+                        }),
+                        "nor" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts)
+                                .or(mask_of(b, &masks, &consts))
+                                .not()
+                        }),
+                        "xnor" => src.get(1).map_or(MaskBits::UNKNOWN, |b| {
+                            mask_of(&src[0], &masks, &consts)
+                                .xor(mask_of(b, &masks, &consts))
+                                .not()
+                        }),
+                        "cselect" => {
+                            if let [a, b] = &src[..] {
+                                match scc_const {
+                                    Some(true) => mask_of(a, &masks, &consts),
+                                    Some(false) => mask_of(b, &masks, &consts),
+                                    None => {
+                                        let ma = mask_of(a, &masks, &consts);
+                                        let mb = mask_of(b, &masks, &consts);
+                                        MaskBits {
+                                            active: if ma.active == mb.active {
+                                                ma.active
+                                            } else {
+                                                None
+                                            },
+                                            inactive: if ma.inactive == mb.inactive {
+                                                ma.inactive
+                                            } else {
+                                                None
+                                            },
+                                        }
+                                    }
+                                }
+                            } else {
+                                MaskBits::UNKNOWN
+                            }
+                        }
+                        _ => MaskBits::UNKNOWN,
+                    };
+                    if let Some(Operand::Scalar { code, .. }) = *dst
+                        && code != NULL
+                    {
+                        new_mask = Some((code, res));
+                    }
+                    if inst.writes.iter().any(|&(r, _)| r == Reg::Scc) {
+                        new_scc_mask = Some(res);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Invalidate overwritten scalar mask pairs and SCC.
+        for &(r, _) in &inst.writes {
+            match r {
+                Reg::S(c) => {
+                    masks.remove(&c);
+                    if wave64 && c > 0 {
+                        masks.remove(&(c - 1));
+                    }
+                }
+                Reg::Scc => {
+                    scc_const = None;
+                    scc_mask = None;
+                }
+                Reg::V(_) => {}
+            }
+        }
+        step_constants(inst, &mut consts);
+        if let Some((code, bits)) = new_mask
+            && bits != MaskBits::UNKNOWN
+        {
+            masks.insert(code, bits);
+        }
+        if new_scc_const.is_some() {
+            scc_const = new_scc_const;
+        }
+        if new_scc_mask.is_some() {
+            scc_mask = new_scc_mask;
+        }
+    }
+
+    match last.name() {
+        "s_cbranch_vccnz" => masks.get(&VCC).copied().and_then(MaskBits::is_nonzero),
+        "s_cbranch_vccz" => masks
+            .get(&VCC)
+            .copied()
+            .and_then(MaskBits::is_nonzero)
+            .map(|nz| !nz),
+        "s_cbranch_scc1" => scc_const.or_else(|| scc_mask.and_then(MaskBits::is_nonzero)),
+        "s_cbranch_scc0" => scc_const
+            .or_else(|| scc_mask.and_then(MaskBits::is_nonzero))
+            .map(|nz| !nz),
+        _ => None,
+    }
+}
+
+fn eval_cmp(name: &str, a: u32, b: u32) -> Option<bool> {
+    let rest = name.strip_prefix("v_cmp_")?;
+    Some(match rest {
+        "eq_u32" | "eq_i32" => a == b,
+        "ne_u32" | "lg_u32" | "ne_i32" | "lg_i32" => a != b,
+        "lt_u32" => a < b,
+        "le_u32" => a <= b,
+        "gt_u32" => a > b,
+        "ge_u32" => a >= b,
+        "lt_i32" => (a as i32) < (b as i32),
+        "le_i32" => (a as i32) <= (b as i32),
+        "gt_i32" => (a as i32) > (b as i32),
+        "ge_i32" => (a as i32) >= (b as i32),
+        _ => {
+            let (fa, fb) = (f32::from_bits(a), f32::from_bits(b));
+            if fa.is_subnormal() || fb.is_subnormal() {
+                return None;
+            }
+            match rest {
+                "eq_f32" => fa == fb,
+                "neq_f32" => fa != fb,
+                "lg_f32" => fa != fb && !fa.is_nan() && !fb.is_nan(),
+                "lt_f32" => fa < fb,
+                "le_f32" => fa <= fb,
+                "gt_f32" => fa > fb,
+                "ge_f32" => fa >= fb,
+                "o_f32" => !fa.is_nan() && !fb.is_nan(),
+                "u_f32" => fa.is_nan() || fb.is_nan(),
+                _ => return None,
+            }
+        }
+    })
+}
+
+fn eval_scmp(name: &str, a: u32, b: u32) -> Option<bool> {
+    let rest = name.strip_prefix("s_cmp_")?;
+    Some(match rest {
+        "eq_u32" | "eq_i32" => a == b,
+        "lg_u32" | "lg_i32" => a != b,
+        "lt_u32" => a < b,
+        "le_u32" => a <= b,
+        "gt_u32" => a > b,
+        "ge_u32" => a >= b,
+        "lt_i32" => (a as i32) < (b as i32),
+        "le_i32" => (a as i32) <= (b as i32),
+        "gt_i32" => (a as i32) > (b as i32),
+        "ge_i32" => (a as i32) >= (b as i32),
+        _ => return None,
+    })
 }
 
 /// Registers live into and out of each block.
@@ -1223,5 +1917,145 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn threads_correlated_flag_past_join_removing_mixed_phi() {
+        // B0 sets sentinel v0 = 0 and may skip B1 (which defines s2 and sets
+        // dynamic flag v0 = s5) straight to the join B2. B2 branches to B4
+        // whenever v0 != -1 || s2 == 0, so the B0 -> B2 edge always jumps to
+        // B4 and never reaches B3's use of s2. Threading B0 -> B4 eliminates
+        // the mixed phi for s2.
+        let p = build_words(
+            &[
+                0xBE82_3C6A, // 0:  s_and_saveexec_b32 s2, vcc_lo  (dead mask in s2)
+                0x7E00_0280, // 4:  v_mov_b32 v0, 0                (sentinel flag)
+                0xBF04_8000, // 8:  s_cmp_lt_i32 s0, 0
+                0xBF85_0003, // 12: s_cbranch_scc1 -> 28 (B2)
+                0xBE82_0381, // 16: s_mov_b32 s2, 1                (B1: payload)
+                0x7E00_0205, // 20: v_mov_b32 v0, s5               (dynamic flag)
+                0xBF82_0000, // 24: s_branch -> 28 (B2)
+                0x7D84_00C1, // 28: v_cmp_eq_u32 vcc_lo, -1, v0    (B2: join)
+                0x8903_C16A, // 32: s_xor_b32 s3, vcc_lo, -1
+                0xBF06_8002, // 36: s_cmp_eq_u32 s2, 0
+                0x8504_807E, // 40: s_cselect_b32 s4, exec_lo, 0
+                0x8803_0403, // 44: s_or_b32 s3, s3, s4
+                0x876A_037E, // 48: s_and_b32 vcc_lo, exec_lo, s3
+                0xBF87_0001, // 52: s_cbranch_vccnz -> 60 (B4)
+                0x7E02_0202, // 56: v_mov_b32 v1, s2               (B3: payload use)
+                S_ENDPGM,    // 60: s_endpgm                       (B4)
+            ],
+            false,
+        );
+        // B0's taken edge now bypasses B2 directly to B4 (offset 60).
+        let Exit::Branch { taken, not_taken } = p.blocks[0].exit else {
+            panic!("{:?}", p.blocks[0].exit);
+        };
+        assert_eq!(p.blocks[taken].offset, 60);
+        assert_eq!(p.blocks[not_taken].offset, 16);
+        // B2 (offset 28) has only B1 as predecessor and no phis.
+        let join = p.blocks.iter().find(|b| b.offset == 28).unwrap();
+        assert_eq!(join.preds.len(), 1);
+        assert!(join.phis.is_empty(), "{:?}", join.phis);
+        // B3's read of s2 comes directly from B1's `s_mov_b32 s2, 1`.
+        let b1 = &p.blocks[not_taken];
+        let b3 = p.blocks.iter().find(|b| b.offset == 56).unwrap();
+        assert_eq!(b3.insts[0].read(Reg::S(2)), b1.insts[0].write(Reg::S(2)));
+    }
+
+    #[test]
+    fn threads_through_empty_nop_block_and_preserves_live_join_writes() {
+        // Same correlated pattern, with an intermediate s_nop block (B_nop)
+        // entered via `s_cbranch_vccnz` and a live `v_mov_b32 v1, 1.0` inside
+        // the join block that must still run on the threaded path into B_exit.
+        let p = build_words(
+            &[
+                0x7E00_0280, // 0:  v_mov_b32 v0, 0
+                0x8AEA_007E, // 4:  s_andn2_b64 vcc, exec, s[0:1]
+                0xBF87_0003, // 8:  s_cbranch_vccnz -> 24 (B_nop)
+                0xBE82_0381, // 12: s_mov_b32 s2, 1                (B_load)
+                0x7E00_0205, // 16: v_mov_b32 v0, s5               (dynamic flag)
+                0xBF82_0001, // 20: s_branch -> 28 (B_join)
+                0xBF80_0000, // 24: s_nop 0                        (B_nop)
+                0x7D84_00C1, // 28: v_cmp_eq_u32 vcc, -1, v0       (B_join)
+                0x7E02_02F2, // 32: v_mov_b32 v1, 1.0              (live at exit!)
+                0x8AEA_6A7E, // 36: s_andn2_b64 vcc, exec, vcc
+                0xBF87_0001, // 40: s_cbranch_vccnz -> 48 (B_exit)
+                0x7E04_0202, // 44: v_mov_b32 v2, s2               (B_use)
+                0x7E06_0301, // 48: v_mov_b32 v3, v1               (B_exit: reads v1)
+                S_ENDPGM,    // 52: s_endpgm
+            ],
+            true,
+        );
+        // B_join (offset 28) keeps only B_load as predecessor; B_nop jumps
+        // through a cloned block carrying only the live `v_mov_b32 v1, 1.0`.
+        let nop = p.blocks.iter().find(|b| b.offset == 24).unwrap();
+        let Exit::Jump(copy_idx) = nop.exit else {
+            panic!("{:?}", nop.exit);
+        };
+        let copy = &p.blocks[copy_idx];
+        let names: Vec<_> = copy.insts.iter().map(Inst::name).collect();
+        assert_eq!(names, ["v_mov_b32"]);
+        let Exit::Jump(exit_idx) = copy.exit else {
+            panic!("{:?}", copy.exit);
+        };
+        assert_eq!(p.blocks[exit_idx].offset, 48);
+        let orig_join = p
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|&(i, b)| i != copy_idx && b.offset == 28)
+            .unwrap()
+            .1;
+        assert_eq!(orig_join.preds.len(), 1);
+        assert!(orig_join.phis.is_empty(), "{:?}", orig_join.phis);
+    }
+
+    #[test]
+    fn does_not_thread_across_exec_write_in_predecessor() {
+        // Writing EXEC after `v_mov_b32 v0, 0` invalidates the vector constant
+        // (lanes reactivated by the EXEC write did not execute the move).
+        let p = build_words(
+            &[
+                0x7E00_0280, // 0:  v_mov_b32 v0, 0
+                0xBEFE_0305, // 4:  s_mov_b32 exec_lo, s5          (modifies EXEC)
+                0xBF04_8000, // 8:  s_cmp_lt_i32 s0, 0
+                0xBF85_0002, // 12: s_cbranch_scc1 -> 24 (B_join)
+                0x7E00_0206, // 16: v_mov_b32 v0, s6               (dynamic flag)
+                0xBF82_0000, // 20: s_branch -> 24 (B_join)
+                0x7D84_00C1, // 24: v_cmp_eq_u32 vcc_lo, -1, v0
+                0xBF86_0001, // 28: s_cbranch_vccz -> 36
+                0x7E02_0280, // 32: v_mov_b32 v1, 0
+                S_ENDPGM,    // 36: s_endpgm
+            ],
+            false,
+        );
+        let join = p.blocks.iter().find(|b| b.offset == 24).unwrap();
+        assert_eq!(join.preds.len(), 2, "must not thread past EXEC write");
+    }
+
+    #[test]
+    fn does_not_fold_inverted_exec_mask_without_masking() {
+        // When v0 == -1, `v_cmp_eq_u32 vcc_lo, -1, v0` yields EXEC, so
+        // `s_xor_b32 s3, vcc_lo, -1` yields `!EXEC`, which is non-zero if
+        // any lane is inactive and zero if all lanes are active. It must NOT
+        // be folded as zero at `s_cbranch_scc1`.
+        let p = build_words(
+            &[
+                0x7E00_02C1, // 0:  v_mov_b32 v0, -1
+                0xBF04_8000, // 4:  s_cmp_lt_i32 s0, 0
+                0xBF85_0002, // 8:  s_cbranch_scc1 -> 20 (B_join)
+                0x7E00_0206, // 12: v_mov_b32 v0, s6
+                0xBF82_0000, // 16: s_branch -> 20 (B_join)
+                0x7D84_00C1, // 20: v_cmp_eq_u32 vcc_lo, -1, v0
+                0x8903_C16A, // 24: s_xor_b32 s3, vcc_lo, -1
+                0xBF85_0001, // 28: s_cbranch_scc1 -> 36
+                0x7E02_0280, // 32: v_mov_b32 v1, 0
+                S_ENDPGM,    // 36: s_endpgm
+            ],
+            false,
+        );
+        let join = p.blocks.iter().find(|b| b.offset == 20).unwrap();
+        assert_eq!(join.preds.len(), 2, "must not fold !EXEC to zero");
     }
 }
