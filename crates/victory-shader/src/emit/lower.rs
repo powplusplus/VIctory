@@ -165,6 +165,7 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    phi_read_blocks: HashMap<Value, HashSet<usize>>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -465,6 +466,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            phi_read_blocks: HashMap::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1114,6 +1116,10 @@ impl<'a> Lower<'a> {
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
+            self.phi_read_blocks
+                .entry(v)
+                .or_default()
+                .insert(self.cur_ir);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
@@ -6880,22 +6886,170 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Edge condition `(bool, holds)` under which a lane traverses `from -> to`.
+    fn edge_cond(&self, from: usize, to: usize) -> (Bool, bool) {
+        match self.x.st.exits[from] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if taken != not_taken => {
+                if to == taken {
+                    (when, true)
+                } else if to == not_taken {
+                    (when, false)
+                } else {
+                    (Bool::TRUE, true)
+                }
+            }
+            _ => (Bool::TRUE, true),
+        }
+    }
+
+    /// Whether incoming edge `q -> b` of phi `p_val` (in block `b`) is dead for
+    /// every lane: `b` branches on a condition disjoint from `q -> b`'s entry
+    /// condition along the only outgoing edge from which any live use of
+    /// `p_val` is reachable without re-entering `b`.
+    fn is_phi_edge_dead(
+        &self,
+        b: usize,
+        q: usize,
+        p_val: Value,
+        live_uses: &HashMap<Value, Vec<(usize, usize)>>,
+    ) -> bool {
+        let LaneExit::Branch {
+            taken, not_taken, ..
+        } = self.x.st.exits[b]
+        else {
+            return false;
+        };
+        if taken == not_taken {
+            return false;
+        }
+        let (in_b, in_holds) = self.edge_cond(q, b);
+        let q_cond = self.x.st.reach[q];
+        if q_cond == Bool::TRUE && in_b == Bool::TRUE && in_holds {
+            return false;
+        }
+        let (t_b, t_holds) = self.edge_cond(b, taken);
+        let (nt_b, nt_holds) = self.edge_cond(b, not_taken);
+        let s_live = if !self
+            .x
+            .st
+            .bools
+            .meet(&[(q_cond, true), (in_b, in_holds), (t_b, t_holds)])
+        {
+            not_taken
+        } else if !self
+            .x
+            .st
+            .bools
+            .meet(&[(q_cond, true), (in_b, in_holds), (nt_b, nt_holds)])
+        {
+            taken
+        } else {
+            return false;
+        };
+        let p = self.x.p;
+        // Never treat as dead if any instruction in `b` itself references `p_val`.
+        if p.blocks[b]
+            .insts
+            .iter()
+            .any(|inst| inst.reads.iter().any(|&(_, rv)| rv == p_val))
+        {
+            return false;
+        }
+        // Check if any direct read or live phi use is reachable from `s_live`
+        // without re-entering `b` (re-entering `b` redefines `p_val`).
+        let direct = self.phi_read_blocks.get(&p_val);
+        let phi_uses = live_uses.get(&p_val);
+        if let Some(d) = direct
+            && d.contains(&b)
+        {
+            return false;
+        }
+        if let Some(uses) = phi_uses
+            && uses.iter().any(|&(pred, dst)| pred == b && dst == s_live)
+        {
+            return false;
+        }
+        // Collect target blocks whose reachability from `s_live` makes `q -> b` live.
+        let mut need = HashSet::new();
+        if let Some(d) = direct {
+            need.extend(d.iter().copied());
+        }
+        if let Some(uses) = phi_uses {
+            for &(pred, _) in uses {
+                if pred != b {
+                    need.insert(pred);
+                }
+            }
+        }
+        if need.is_empty() {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = Vec::new();
+        if s_live != b {
+            seen.insert(s_live);
+            stack.push(s_live);
+        }
+        while let Some(u) = stack.pop() {
+            if need.contains(&u) {
+                return false;
+            }
+            let succs: [Option<usize>; 2] = match p.blocks[u].exit {
+                Exit::Jump(t) => [Some(t), None],
+                Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+                Exit::End | Exit::Indirect => [None, None],
+            };
+            for s in succs.into_iter().flatten() {
+                if s != b && seen.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        true
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        // Incoming edges proven unreachable to every live use (e.g. the impossible
+        // skip-then -> skip-else path of a structured if-then-else) stay dead.
+        let mut live: HashSet<Value> = self.read_phis.clone();
+        let mut live_uses: HashMap<Value, Vec<(usize, usize)>> = HashMap::new();
+        let mut queued_edges: HashSet<(Value, usize)> = HashSet::new();
+        let mut work: Vec<Value> = live.iter().copied().collect();
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            for &arg in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
-                    work.push(arg);
+            let phi = &p.blocks[b].phis[i];
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.tail[q].is_none() || queued_edges.contains(&(v, n)) {
+                    continue;
+                }
+                if self.is_phi_edge_dead(b, q, v, &live_uses) {
+                    continue;
+                }
+                queued_edges.insert((v, n));
+                let arg = phi.args[n];
+                if self.phi_at.contains_key(&arg) {
+                    let uses = live_uses.entry(arg).or_default();
+                    if !uses.contains(&(q, b)) {
+                        uses.push((q, b));
+                        live.insert(arg);
+                        work.push(arg);
+                    } else if live.insert(arg) {
+                        work.push(arg);
+                    }
                 }
             }
         }
+        self.read_phis = live;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6904,15 +7058,17 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                let edge_live =
+                    self.read_phis.contains(&phi.value) && queued_edges.contains(&(phi.value, n));
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if edge_live => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _) if edge_live => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if edge_live => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
@@ -7417,5 +7573,37 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn dead_incoming_phi_edge_across_structured_if_else_is_ignored() {
+        // v2 starts with a missing value (s_memtime), then both arms of a
+        // structured if-then-else overwrite v2. The skip-then -> skip-else path
+        // is unsatisfiable, so the incoming edge carrying the missing value into
+        // the else-header phi is dead and dropped.
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+            0xBF88_0001, // s_cbranch_execz -> else_hdr
+            0x7E04_0281, // then: v_mov_b32 v2, 1
+            0x8A7E_7E04, // else_hdr: s_andn2_b32 exec_lo, s4, exec_lo
+            0xBF88_0001, // s_cbranch_execz -> after
+            0x7E04_0282, // else: v_mov_b32 v2, 2
+            0xBEFE_0304, // after: s_mov_b32 exec_lo, s4
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let lds = 1 << 15;
+        lowers(&words, lds).expect("dead skip-then -> skip-else phi edge");
+        // Without overwriting v2 in `else`, the edge is live and must refuse.
+        words[9] = 0x7E06_0282; // v_mov_b32 v3, 2
+        assert!(matches!(
+            lowers(&words, lds),
+            Err(crate::ShaderError::Unsupported { .. })
+        ));
     }
 }
