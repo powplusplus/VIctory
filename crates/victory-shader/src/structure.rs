@@ -228,22 +228,37 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let mut failed: HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>> = HashSet::default();
+        self.meet_in(all.to_vec(), &mut budget, &mut failed)
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        failed: &mut HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
+        all.sort_unstable_by_key(|&(b, holds)| (b.0, holds));
+        all.dedup();
+        if all.windows(2).any(|w| w[0].0 == w[1].0) {
+            return false;
+        }
+        // In a reduced BDD, every non-terminal node reaches both TRUE and FALSE.
+        if all.len() <= 1 || *budget == 0 {
             return true;
+        }
+        if failed.contains(&all) {
+            return false;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let found = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +266,12 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, failed)
+        });
+        if !found {
+            failed.insert(all);
+        }
+        found
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -632,7 +651,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -1230,5 +1253,26 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn meet_prunes_contradictions_and_memoizes_deep_dags() {
+        let mut b = Bools::new();
+        // Build a 24-variable parity chain (exponential without memoization).
+        let mut x = Bool::FALSE;
+        for i in 0..24 {
+            let a = b.atom(Atom::Lane(Value(i)), 0);
+            x = b.xor(x, a);
+        }
+        let nx = b.not(x);
+        assert!(b.meet(&[(x, true)]));
+        assert!(!b.meet(&[(x, true), (x, false)]));
+        assert!(!b.meet(&[(x, true), (nx, true)]));
+        // Distinct shared sub-DAGs whose conjunction is unsatisfiable.
+        let a0 = b.atom(Atom::Lane(Value(0)), 0);
+        let y = b.and(x, a0);
+        let z = b.and(nx, a0);
+        assert!(!b.meet(&[(y, true), (z, true)]));
+        assert!(b.meet(&[(x, true), (a0, true)]));
     }
 }
